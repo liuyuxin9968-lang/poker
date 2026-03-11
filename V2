@@ -1,0 +1,417 @@
+// WebSocket服务器 - 完整的多人21点游戏后端
+export default {
+  // 存储所有房间和连接
+  rooms: new Map(),
+  connections: new Map(),
+  
+  async fetch(request, env, ctx) {
+    // 处理WebSocket升级
+    const upgradeHeader = request.headers.get('Upgrade');
+    if (!upgradeHeader || upgradeHeader !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 400 });
+    }
+
+    // 获取客户端IP作为简单标识
+    const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+    
+    // 创建WebSocket对
+    const [client, server] = Object.values(new WebSocketPair());
+    
+    // 接受连接
+    server.accept();
+    
+    // 为新连接分配ID
+    const connectionId = crypto.randomUUID();
+    this.connections.set(connectionId, {
+      ws: server,
+      playerId: null,
+      roomId: null,
+      ip: clientIP
+    });
+    
+    console.log(`新连接: ${connectionId}`);
+    
+    // 处理消息
+    server.addEventListener('message', async (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('收到消息:', data);
+        
+        // 根据消息类型处理
+        await this.handleMessage(connectionId, data, server);
+      } catch (e) {
+        console.error('处理消息失败:', e);
+        server.send(JSON.stringify({
+          type: 'error',
+          message: '消息格式错误'
+        }));
+      }
+    });
+    
+    // 处理关闭
+    server.addEventListener('close', () => {
+      console.log(`连接关闭: ${connectionId}`);
+      this.handleDisconnect(connectionId);
+      this.connections.delete(connectionId);
+    });
+    
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  },
+  
+  // 处理消息
+  async handleMessage(connectionId, data, ws) {
+    const conn = this.connections.get(connectionId);
+    if (!conn) return;
+    
+    switch(data.type) {
+      case 'init':
+        // 初始化玩家
+        conn.playerId = data.playerId;
+        conn.nickname = data.nickname;
+        ws.send(JSON.stringify({
+          type: 'initSuccess',
+          playerId: data.playerId
+        }));
+        break;
+        
+      case 'getRooms':
+        // 发送房间列表
+        const roomsList = Array.from(this.rooms.values()).map(room => ({
+          id: room.id,
+          name: room.name,
+          host: room.host,
+          maxPlayers: room.maxPlayers,
+          playerCount: room.players.size
+        }));
+        ws.send(JSON.stringify({
+          type: 'roomList',
+          rooms: roomsList
+        }));
+        break;
+        
+      case 'createRoom':
+        // 创建新房间
+        const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+        const newRoom = {
+          id: roomId,
+          name: data.roomName,
+          host: conn.nickname,
+          hostId: conn.playerId,
+          maxPlayers: data.maxPlayers,
+          players: new Map(),
+          seats: Array(10).fill(null),
+          gameState: 'waiting',
+          createdAt: Date.now()
+        };
+        
+        // 房主加入房间
+        newRoom.players.set(conn.playerId, {
+          playerId: conn.playerId,
+          nickname: conn.nickname,
+          gold: 10000,
+          isHost: true,
+          seat: null
+        });
+        
+        this.rooms.set(roomId, newRoom);
+        conn.roomId = roomId;
+        
+        // 通知创建成功
+        ws.send(JSON.stringify({
+          type: 'roomJoined',
+          room: {
+            id: roomId,
+            name: data.roomName,
+            host: conn.nickname,
+            maxPlayers: data.maxPlayers
+          },
+          players: Array.from(newRoom.players.values()),
+          seats: newRoom.seats
+        }));
+        
+        // 广播房间列表更新
+        this.broadcastRoomList();
+        break;
+        
+      case 'joinRoom':
+        // 加入房间
+        const room = this.rooms.get(data.roomId);
+        if (!room) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: '房间不存在'
+          }));
+          return;
+        }
+        
+        if (room.players.size >= room.maxPlayers) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: '房间已满'
+          }));
+          return;
+        }
+        
+        // 加入房间
+        room.players.set(conn.playerId, {
+          playerId: conn.playerId,
+          nickname: conn.nickname,
+          gold: data.gold,
+          isHost: false,
+          seat: null
+        });
+        
+        conn.roomId = data.roomId;
+        
+        // 通知加入成功
+        ws.send(JSON.stringify({
+          type: 'roomJoined',
+          room: {
+            id: room.id,
+            name: room.name,
+            host: room.host,
+            maxPlayers: room.maxPlayers
+          },
+          players: Array.from(room.players.values()),
+          seats: room.seats
+        }));
+        
+        // 通知房间内其他玩家
+        this.broadcastToRoom(room.id, {
+          type: 'playerJoined',
+          player: {
+            playerId: conn.playerId,
+            nickname: conn.nickname,
+            gold: data.gold,
+            isHost: false,
+            seat: null
+          }
+        }, conn.playerId);
+        
+        // 广播房间列表更新
+        this.broadcastRoomList();
+        break;
+        
+      case 'leaveRoom':
+        // 离开房间
+        if (conn.roomId) {
+          const leaveRoom = this.rooms.get(conn.roomId);
+          if (leaveRoom) {
+            // 如果是房主，解散房间
+            if (leaveRoom.hostId === conn.playerId) {
+              this.broadcastToRoom(conn.roomId, {
+                type: 'roomClosed'
+              });
+              this.rooms.delete(conn.roomId);
+            } else {
+              // 普通玩家离开
+              leaveRoom.players.delete(conn.playerId);
+              // 清理座位
+              for (let i = 0; i < leaveRoom.seats.length; i++) {
+                if (leaveRoom.seats[i] && leaveRoom.seats[i].playerId === conn.playerId) {
+                  leaveRoom.seats[i] = null;
+                  break;
+                }
+              }
+              
+              this.broadcastToRoom(conn.roomId, {
+                type: 'playerLeft',
+                playerId: conn.playerId
+              }, conn.playerId);
+            }
+            
+            // 广播房间列表更新
+            this.broadcastRoomList();
+          }
+          conn.roomId = null;
+        }
+        
+        ws.send(JSON.stringify({
+          type: 'leftRoom'
+        }));
+        break;
+        
+      case 'sitDown':
+        // 坐下
+        if (!conn.roomId) return;
+        const sitRoom = this.rooms.get(conn.roomId);
+        if (!sitRoom) return;
+        
+        // 检查座位是否空
+        if (sitRoom.seats[data.seat] !== null) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: '座位已有人'
+          }));
+          return;
+        }
+        
+        // 检查玩家是否已经坐在别处
+        for (let i = 0; i < sitRoom.seats.length; i++) {
+          if (sitRoom.seats[i] && sitRoom.seats[i].playerId === conn.playerId) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: '你已经坐在其他位置了'
+            }));
+            return;
+          }
+        }
+        
+        // 坐下
+        const seatData = {
+          playerId: conn.playerId,
+          nickname: conn.nickname,
+          points: data.points,
+          bet: 0,
+          hand: []
+        };
+        
+        sitRoom.seats[data.seat] = seatData;
+        
+        // 更新玩家信息
+        const player = sitRoom.players.get(conn.playerId);
+        if (player) {
+          player.seat = data.seat;
+          player.gold -= data.points;
+        }
+        
+        // 广播给所有人
+        this.broadcastToRoom(conn.roomId, {
+          type: 'playerSat',
+          playerId: conn.playerId,
+          seat: data.seat,
+          seatData: seatData
+        });
+        break;
+        
+      case 'placeBet':
+        // 下注
+        if (!conn.roomId) return;
+        const betRoom = this.rooms.get(conn.roomId);
+        if (!betRoom) return;
+        
+        // 找到玩家的座位
+        let playerSeat = -1;
+        for (let i = 0; i < betRoom.seats.length; i++) {
+          if (betRoom.seats[i] && betRoom.seats[i].playerId === conn.playerId) {
+            playerSeat = i;
+            break;
+          }
+        }
+        
+        if (playerSeat === -1) return;
+        
+        const seat = betRoom.seats[playerSeat];
+        if (data.amount > seat.points) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: '积分不足'
+          }));
+          return;
+        }
+        
+        seat.points -= data.amount;
+        seat.bet += data.amount;
+        
+        this.broadcastToRoom(conn.roomId, {
+          type: 'betPlaced',
+          seat: playerSeat,
+          bet: seat.bet,
+          points: seat.points
+        });
+        break;
+        
+      case 'startGame':
+        // 开始游戏（需要完整实现）
+        // 这里简化处理
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: '游戏功能开发中'
+        }));
+        break;
+        
+      case 'playerAction':
+        // 玩家行动（需要完整实现）
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: '游戏功能开发中'
+        }));
+        break;
+    }
+  },
+  
+  // 处理断开连接
+  handleDisconnect(connectionId) {
+    const conn = this.connections.get(connectionId);
+    if (!conn) return;
+    
+    if (conn.roomId) {
+      const room = this.rooms.get(conn.roomId);
+      if (room) {
+        // 如果是房主，解散房间
+        if (room.hostId === conn.playerId) {
+          this.broadcastToRoom(conn.roomId, {
+            type: 'roomClosed'
+          });
+          this.rooms.delete(conn.roomId);
+        } else {
+          // 普通玩家离开
+          room.players.delete(conn.playerId);
+          // 清理座位
+          for (let i = 0; i < room.seats.length; i++) {
+            if (room.seats[i] && room.seats[i].playerId === conn.playerId) {
+              room.seats[i] = null;
+              break;
+            }
+          }
+          
+          this.broadcastToRoom(conn.roomId, {
+            type: 'playerLeft',
+            playerId: conn.playerId
+          }, conn.playerId);
+        }
+        
+        // 广播房间列表更新
+        this.broadcastRoomList();
+      }
+    }
+  },
+  
+  // 广播到房间内所有人
+  broadcastToRoom(roomId, message, excludePlayerId = null) {
+    for (let [connId, conn] of this.connections) {
+      if (conn.roomId === roomId && conn.playerId !== excludePlayerId) {
+        try {
+          conn.ws.send(JSON.stringify(message));
+        } catch (e) {
+          console.error(`广播失败: ${connId}`, e);
+        }
+      }
+    }
+  },
+  
+  // 广播房间列表给所有连接
+  broadcastRoomList() {
+    const roomsList = Array.from(this.rooms.values()).map(room => ({
+      id: room.id,
+      name: room.name,
+      host: room.host,
+      maxPlayers: room.maxPlayers,
+      playerCount: room.players.size
+    }));
+    
+    for (let [connId, conn] of this.connections) {
+      try {
+        conn.ws.send(JSON.stringify({
+          type: 'roomList',
+          rooms: roomsList
+        }));
+      } catch (e) {
+        console.error(`广播房间列表失败: ${connId}`, e);
+      }
+    }
+  }
+};
